@@ -12,6 +12,7 @@
 
 #include "Transform/Passes.h"
 #include "TritonToTileIR/Passes.h"
+#include "CudaTileToTriton/Passes.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -32,6 +33,7 @@ inline void registerTritonCudaTileDialects(mlir::DialectRegistry &registry) {
   mlir::registerAllPasses();
 
   mlir::triton::registerConvertTritonToCudaTilePass();
+  mlir::triton::registerConvertCudaTileToTritonPass();
   mlir::triton::registerRewriteAssumeWithCudaTilePass();
   mlir::triton::registerAutoGenMemoryTokenPass();
   registry.insert<mlir::cuda_tile::CudaTileDialect>();

@@ -9,6 +9,7 @@ target_link_libraries(triton-cuda-tile-opt PRIVATE
   TritonTransforms
   TritonTileIRTransforms
   TritonToTileIR
+  TritonCudaTileToTriton
   TritonNvidiaGPUTransforms
   # tests
   TritonTestAnalysis
