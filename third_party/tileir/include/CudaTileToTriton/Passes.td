@@ -14,6 +14,7 @@ def ConvertCudaTileToTriton : Pass<"convert-cuda-tile-to-triton", "mlir::ModuleO
     }];
     let constructor = "mlir::triton::createConvertCudaTileToTritonPass()";
     let dependentDialects = ["mlir::arith::ArithDialect",
+                             "mlir::math::MathDialect",
                              "mlir::triton::TritonDialect",
                              "mlir::cuda_tile::CudaTileDialect"];
 }

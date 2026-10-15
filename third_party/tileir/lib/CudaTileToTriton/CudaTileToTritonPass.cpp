@@ -1,25 +1,40 @@
 //===- CudaTileToTritonPass.cpp - Convert CUDA Tile IR to Triton IR -------===//
 //
-// POC reverse translation of `convert-triton-to-cuda-tile`. Supports the
-// sum-of-two-tiles round trip:
+// POC reverse translation of `convert-triton-to-cuda-tile`. Supported ops:
 //
 //   iota            -> tt.make_range
+//   constant        -> arith.constant
 //   reshape (s ->1) -> tt.splat
 //   broadcast (1->N)-> tt.broadcast
 //   offset          -> tt.addptr
-//   load_ptr_tko    -> tt.load (token dropped, must be unused)
-//   store_ptr_tko   -> tt.store (token dropped, must be unused)
-//   addf            -> arith.addf
+//   load_ptr_tko    -> tt.load (token dropped)
+//   store_ptr_tko   -> tt.store (token dropped)
+//   addf/mulf/divf  -> arith.addf/mulf/divf (rounding/ftz modifiers ignored)
+//   negf            -> arith.negf
+//   exp             -> math.exp
+//   addi/muli       -> arith.addi/muli
+//   exti            -> arith.extsi/extui
+//   ftof            -> arith.extf/truncf
+//   get_tile_block_id -> 3x tt.get_program_id
 //   assume          -> erased (POC: assumptions are not reconstructed)
 //   entry           -> tt.func
+//
+// Tokens: CUDA Tile uses tokens to order token-ordered (tko) ops; Triton IR
+// has no token concept. Since Triton loads/stores are ordered by program
+// order, token inputs are dropped and unused token results are discarded. A
+// pre-pass rewrites loads/stores to not consume tokens and erases
+// `make_token`. Programs that depend on token results (joins/fences) are
+// rejected.
 //
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "CudaTileToTriton/Passes.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
@@ -37,12 +52,14 @@ namespace triton {
 
 using namespace mlir;
 using namespace mlir::triton;
+namespace tt = ::mlir::triton;
 
 namespace {
 
 //===----------------------------------------------------------------------===//
 // Type conversion: tile<SxE> -> tensor<SxE'> (or scalar E' for rank-0 tiles),
-// where ptr<E> elements map to !tt.ptr<E>.
+// where ptr<E> elements map to !tt.ptr<E>. Token types pass through (they are
+// dropped by the op patterns, never converted values are produced).
 //===----------------------------------------------------------------------===//
 
 class CudaTileToTritonTypeConverter : public TypeConverter {
@@ -52,7 +69,8 @@ public:
     // producers were converted first) pass through unchanged. Registered
     // first so it is consulted last.
     addConversion([](Type type) -> std::optional<Type> {
-      if (isa<RankedTensorType, triton::PointerType>(type))
+      if (isa<RankedTensorType, triton::PointerType, cuda_tile::TokenType,
+              IntegerType, FloatType>(type))
         return type;
       return std::nullopt;
     });
@@ -65,6 +83,64 @@ public:
         return tritonElementType;
       return RankedTensorType::get(tileType.getShape(), tritonElementType);
     });
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Token pre-pass patterns (run before dialect conversion, on tile-typed IR)
+//===----------------------------------------------------------------------===//
+
+// Rebuild a load without its token input. The token result is preserved so
+// that the op shape is unchanged; the conversion drops it later.
+struct DropLoadTokenInput : public OpRewritePattern<cuda_tile::LoadPtrTkoOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::LoadPtrTkoOp op,
+                  PatternRewriter &rewriter) const override {
+    if (!op.getToken())
+      return failure();
+    auto newOp = cuda_tile::LoadPtrTkoOp::create(
+        rewriter, op.getLoc(), op.getResult().getType(),
+        op.getResultToken().getType(), op.getMemoryOrderingSemanticsAttr(),
+        op.getMemoryScopeAttr(), op.getSource(), op.getMask(),
+        op.getPaddingValue(), /*token=*/nullptr,
+        op.getOptimizationHintsAttr());
+    rewriter.replaceOp(op, newOp);
+    return success();
+  }
+};
+
+struct DropStoreTokenInput
+    : public OpRewritePattern<cuda_tile::StorePtrTkoOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::StorePtrTkoOp op,
+                  PatternRewriter &rewriter) const override {
+    if (!op.getToken())
+      return failure();
+    auto newOp = cuda_tile::StorePtrTkoOp::create(
+        rewriter, op.getLoc(), op.getResultToken().getType(),
+        op.getMemoryOrderingSemanticsAttr(), op.getMemoryScopeAttr(),
+        op.getDestination(), op.getValue(), op.getMask(), /*token=*/nullptr,
+        op.getOptimizationHintsAttr());
+    rewriter.replaceOp(op, newOp);
+    return success();
+  }
+};
+
+// Once no load/store consumes tokens, `make_token` is dead.
+struct EraseMakeToken : public OpRewritePattern<cuda_tile::MakeTokenOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MakeTokenOp op,
+                  PatternRewriter &rewriter) const override {
+    if (!op->getResult(0).use_empty())
+      return failure();
+    rewriter.eraseOp(op);
+    return success();
   }
 };
 
@@ -89,6 +165,34 @@ struct ConvertIota : public OpConversionPattern<cuda_tile::IotaOp> {
     int64_t n = newResultType.getShape().front();
     rewriter.replaceOpWithNewOp<triton::MakeRangeOp>(op, newResultType,
                                                      /*start=*/0, /*end=*/n);
+    return success();
+  }
+};
+
+struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::ConstantOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type newType = getTypeConverter()->convertType(op.getResult().getType());
+    DenseTypedElementsAttr value = op.getValue();
+    Attribute newAttr;
+    if (auto tensorType = dyn_cast<RankedTensorType>(newType)) {
+      // Element type is unchanged, so the payload transfers directly.
+      TypedAttr attr = value.isSplat()
+                           ? DenseElementsAttr::get(
+                                 tensorType, value.getSplatValue<Attribute>())
+                           : DenseElementsAttr::getFromRawBuffer(
+                                 tensorType, value.getRawData());
+      rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, newType, attr);
+      return success();
+    }
+    // Rank-0 tile: scalar constant.
+    TypedAttr splat = cast<TypedAttr>(value.getSplatValue<Attribute>());
+    if (!splat)
+      return op.emitOpError("POC: non-splat rank-0 constant");
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, newType, splat);
     return success();
   }
 };
@@ -145,17 +249,20 @@ struct ConvertLoadPtrTko : public OpConversionPattern<cuda_tile::LoadPtrTkoOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::LoadPtrTkoOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // POC: token-threaded programs are rejected.
+    // The token input is dropped by the pre-pass; a token result must not be
+    // consumed by anything (joins/fences are unsupported).
     if (!op.getResultToken().use_empty())
       return op.emitOpError("POC: used token results are not supported");
     Type newResultType = getTypeConverter()->convertType(op.getResult().getType());
+    // Padding only applies where the mask is false: without a mask it is a
+    // no-op, so it is dropped.
+    Value mask = adaptor.getMask();
+    Value padding = mask ? adaptor.getPaddingValue() : Value();
     auto newLoad = triton::LoadOp::create(
-        rewriter, op.getLoc(), newResultType, adaptor.getSource(), Value(),
-        Value(), Attribute(), /*isVolatile=*/false);
-    // Replace the value result with the tt.load result and drop the (unused)
-    // token result.
-    rewriter.replaceOpWithMultiple(op,
-                                   {{newLoad.getResult()}, {}});
+        rewriter, op.getLoc(), newResultType, adaptor.getSource(), mask,
+        padding, Attribute(), /*isVolatile=*/false);
+    // Replace the value result with the tt.load result and drop the token.
+    rewriter.replaceOpWithMultiple(op, {{newLoad.getResult()}, {}});
     return success();
   }
 };
@@ -167,13 +274,32 @@ struct ConvertStorePtrTko
   LogicalResult
   matchAndRewrite(cuda_tile::StorePtrTkoOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // POC: token-threaded programs are rejected.
     if (!op.getResultToken().use_empty())
       return op.emitOpError("POC: used token results are not supported");
-    triton::StoreOp::create(rewriter, op.getLoc(), adaptor.getDestination(),
-                            adaptor.getValue());
-    // Drop the (unused) token result.
+    if (adaptor.getMask())
+      triton::StoreOp::create(rewriter, op.getLoc(), adaptor.getDestination(),
+                              adaptor.getValue(), adaptor.getMask());
+    else
+      triton::StoreOp::create(rewriter, op.getLoc(), adaptor.getDestination(),
+                              adaptor.getValue());
+    // Drop the token result.
     rewriter.replaceOpWithMultiple(op, {{}});
+    return success();
+  }
+};
+
+// POC: divf rounding modes (approx/full) and flush_to_zero are dropped;
+// arith.divf is IEEE-accurate, which is a strict upgrade over `approx`.
+struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::DivFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type newResultType = getTypeConverter()->convertType(op.getResult().getType());
+    rewriter.replaceOpWithNewOp<arith::DivFOp>(op, newResultType,
+                                               adaptor.getLhs(),
+                                               adaptor.getRhs());
     return success();
   }
 };
@@ -184,13 +310,6 @@ struct ConvertAddF : public OpConversionPattern<cuda_tile::AddFOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::AddFOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getFlushToZero())
-      return op.emitOpError("POC: flush_to_zero modifier is not supported");
-    auto roundingMode = op->getAttrOfType<cuda_tile::RoundingModeAttr>(
-        cuda_tile::AddFOp::getRoundingModeAttrName(op->getName()));
-    if (roundingMode &&
-        roundingMode.getValue() != cuda_tile::RoundingMode::NEAREST_EVEN)
-      return op.emitOpError("POC: rounding mode modifiers are not supported");
     Type newResultType = getTypeConverter()->convertType(op.getResult().getType());
     rewriter.replaceOpWithNewOp<arith::AddFOp>(op, newResultType,
                                                adaptor.getLhs(),
@@ -199,8 +318,138 @@ struct ConvertAddF : public OpConversionPattern<cuda_tile::AddFOp> {
   }
 };
 
-// POC: `assume` carries Triton arg-attr information (e.g. divisibility) that
-// has no home in the reverse translation yet, so it is dropped.
+struct ConvertMulF : public OpConversionPattern<cuda_tile::MulFOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MulFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type newResultType = getTypeConverter()->convertType(op.getResult().getType());
+    rewriter.replaceOpWithNewOp<arith::MulFOp>(op, newResultType,
+                                               adaptor.getLhs(),
+                                               adaptor.getRhs());
+    return success();
+  }
+};
+
+struct ConvertNegF : public OpConversionPattern<cuda_tile::NegFOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::NegFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type newResultType = getTypeConverter()->convertType(op.getResult().getType());
+    // Lower to `0 - x` rather than `arith.negf`: stock Triton (e.g. 3.5.1)
+    // rejects `arith.negf` in convert-triton-to-tritongpu, and its own
+    // frontend emits `subf 0, x` for unary minus.
+    auto zero = arith::ConstantOp::create(
+        rewriter, op.getLoc(), newResultType,
+        rewriter.getZeroAttr(newResultType));
+    rewriter.replaceOpWithNewOp<arith::SubFOp>(op, newResultType,
+                                               zero.getResult(),
+                                               adaptor.getSource());
+    return success();
+  }
+};
+
+struct ConvertExp : public OpConversionPattern<cuda_tile::ExpOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::ExpOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type newResultType = getTypeConverter()->convertType(op.getResult().getType());
+    rewriter.replaceOpWithNewOp<math::ExpOp>(op, newResultType,
+                                             adaptor.getSource());
+    return success();
+  }
+};
+
+struct ConvertAddI : public OpConversionPattern<cuda_tile::AddIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::AddIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type newResultType = getTypeConverter()->convertType(op.getResult().getType());
+    rewriter.replaceOpWithNewOp<arith::AddIOp>(op, newResultType,
+                                               adaptor.getLhs(),
+                                               adaptor.getRhs());
+    return success();
+  }
+};
+
+struct ConvertMulI : public OpConversionPattern<cuda_tile::MulIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MulIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type newResultType = getTypeConverter()->convertType(op.getResult().getType());
+    rewriter.replaceOpWithNewOp<arith::MulIOp>(op, newResultType,
+                                               adaptor.getLhs(),
+                                               adaptor.getRhs());
+    return success();
+  }
+};
+
+struct ConvertExtI : public OpConversionPattern<cuda_tile::ExtIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::ExtIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type newResultType = getTypeConverter()->convertType(op.getResult().getType());
+    if (op.getSignedness() == cuda_tile::Signedness::Signed)
+      rewriter.replaceOpWithNewOp<arith::ExtSIOp>(op, newResultType,
+                                                  adaptor.getFrom());
+    else
+      rewriter.replaceOpWithNewOp<arith::ExtUIOp>(op, newResultType,
+                                                  adaptor.getFrom());
+    return success();
+  }
+};
+
+struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::FToFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto fromType = cast<cuda_tile::TileType>(op.getFrom().getType());
+    auto toType = cast<cuda_tile::TileType>(op.getResult().getType());
+    unsigned fromWidth = fromType.getElementType().getIntOrFloatBitWidth();
+    unsigned toWidth = toType.getElementType().getIntOrFloatBitWidth();
+    Type newResultType = getTypeConverter()->convertType(op.getResult().getType());
+    if (toWidth > fromWidth)
+      rewriter.replaceOpWithNewOp<arith::ExtFOp>(op, newResultType,
+                                                 adaptor.getFrom());
+    else
+      rewriter.replaceOpWithNewOp<arith::TruncFOp>(op, newResultType,
+                                                   adaptor.getFrom());
+    return success();
+  }
+};
+
+struct ConvertGetTileBlockId
+    : public OpConversionPattern<cuda_tile::GetTileBlockIdOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::GetTileBlockIdOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto x = tt::GetProgramIdOp::create(rewriter, op.getLoc(), 0);
+    auto y = tt::GetProgramIdOp::create(rewriter, op.getLoc(), 1);
+    auto z = tt::GetProgramIdOp::create(rewriter, op.getLoc(), 2);
+    rewriter.replaceOpWithMultiple(op, {{x.getResult()},
+                                        {y.getResult()},
+                                        {z.getResult()}});
+    return success();
+  }
+};
+
+// POC: `assume` carries information (divisibility, bounds) that has no home
+// in the reverse translation yet, so it is dropped.
 struct ConvertAssume : public OpConversionPattern<cuda_tile::AssumeOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -256,9 +505,22 @@ struct ConvertCudaTileToTriton
     for (Operation *op : llvm::reverse(cudaModules))
       op->erase();
 
-    // 3. Convert the cloned bodies from cuda_tile ops to Triton ops.
+    // 3. Drop token inputs from loads/stores and erase dead `make_token`s so
+    //    the dialect conversion below never sees live token values.
+    for (triton::FuncOp func : funcs) {
+      RewritePatternSet tokenPatterns(func.getContext());
+      tokenPatterns.add<DropLoadTokenInput, DropStoreTokenInput,
+                        EraseMakeToken>(func.getContext());
+      if (failed(applyPatternsGreedily(func, std::move(tokenPatterns)))) {
+        func->emitOpError("POC: failed to drop token inputs");
+        return signalPassFailure();
+      }
+    }
+
+    // 4. Convert the cloned bodies from cuda_tile ops to Triton ops.
     ConversionTarget target(*context);
-    target.addLegalDialect<triton::TritonDialect, arith::ArithDialect>();
+    target.addLegalDialect<triton::TritonDialect, arith::ArithDialect,
+                           math::MathDialect>();
     target.addIllegalDialect<cuda_tile::CudaTileDialect>();
 
     RewritePatternSet patterns(context);
@@ -266,12 +528,22 @@ struct ConvertCudaTileToTriton
         /* clang-format off */
         ConvertAssume,
         ConvertIota,
+        ConvertConstant,
         ConvertReshape,
         ConvertBroadcast,
         ConvertOffset,
         ConvertLoadPtrTko,
         ConvertStorePtrTko,
-        ConvertAddF
+        ConvertAddF,
+        ConvertDivF,
+        ConvertMulF,
+        ConvertNegF,
+        ConvertExp,
+        ConvertAddI,
+        ConvertMulI,
+        ConvertExtI,
+        ConvertFToF,
+        ConvertGetTileBlockId
         /* clang-format on */
         >(typeConverter, context);
     FrozenRewritePatternSet frozen(std::move(patterns));
@@ -304,7 +576,7 @@ private:
 
     // Map the (tile-typed) entry block arguments to the converted tt.func
     // block arguments, then clone the body. The clone still contains
-    // cuda_tile ops with tile types; step 3 converts them.
+    // cuda_tile ops with tile types; step 4 converts them.
     auto &body = func.getBody().front();
     IRMapping mapping;
     for (auto [oldArg, newType] :
