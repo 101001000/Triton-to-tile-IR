@@ -47,6 +47,8 @@ namespace mlir {
 namespace triton {
 #define GEN_PASS_DEF_CONVERTCUDATILETOTRITON
 #include "CudaTileToTriton/Passes.h.inc"
+#define GEN_PASS_DEF_CUDATILEDROPTOKENS
+#include "CudaTileToTriton/Passes.h.inc"
 } // namespace triton
 } // namespace mlir
 
@@ -464,6 +466,22 @@ struct ConvertAssume : public OpConversionPattern<cuda_tile::AssumeOp> {
 } // namespace
 
 //===----------------------------------------------------------------------===//
+// Token dropping (shared by the standalone pass and the reverse conversion)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+LogicalResult dropTokenInputs(Operation *scope) {
+  MLIRContext *context = scope->getContext();
+  RewritePatternSet tokenPatterns(context);
+  tokenPatterns.add<DropLoadTokenInput, DropStoreTokenInput, EraseMakeToken>(
+      context);
+  return applyPatternsGreedily(scope, std::move(tokenPatterns));
+}
+
+} // namespace
+
+//===----------------------------------------------------------------------===//
 // Pass implementation
 //===----------------------------------------------------------------------===//
 
@@ -508,10 +526,7 @@ struct ConvertCudaTileToTriton
     // 3. Drop token inputs from loads/stores and erase dead `make_token`s so
     //    the dialect conversion below never sees live token values.
     for (triton::FuncOp func : funcs) {
-      RewritePatternSet tokenPatterns(func.getContext());
-      tokenPatterns.add<DropLoadTokenInput, DropStoreTokenInput,
-                        EraseMakeToken>(func.getContext());
-      if (failed(applyPatternsGreedily(func, std::move(tokenPatterns)))) {
+      if (failed(dropTokenInputs(func))) {
         func->emitOpError("POC: failed to drop token inputs");
         return signalPassFailure();
       }
@@ -592,7 +607,31 @@ private:
 
 } // namespace
 
+//===----------------------------------------------------------------------===//
+// CudaTileDropTokens: standalone token-removal pass on CUDA Tile IR
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+struct CudaTileDropTokens
+    : public mlir::triton::impl::CudaTileDropTokensBase<CudaTileDropTokens> {
+  using mlir::triton::impl::CudaTileDropTokensBase<
+      CudaTileDropTokens>::CudaTileDropTokensBase;
+
+  void runOnOperation() override {
+    if (failed(dropTokenInputs(getOperation())))
+      return signalPassFailure();
+  }
+};
+
+} // namespace
+
 std::unique_ptr<Pass>
 mlir::triton::createConvertCudaTileToTritonPass() {
   return std::make_unique<ConvertCudaTileToTriton>();
+}
+
+std::unique_ptr<Pass>
+mlir::triton::createCudaTileDropTokensPass() {
+  return std::make_unique<CudaTileDropTokens>();
 }

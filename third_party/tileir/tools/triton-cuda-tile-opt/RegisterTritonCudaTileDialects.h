@@ -34,6 +34,7 @@ inline void registerTritonCudaTileDialects(mlir::DialectRegistry &registry) {
 
   mlir::triton::registerConvertTritonToCudaTilePass();
   mlir::triton::registerConvertCudaTileToTritonPass();
+  mlir::triton::registerCudaTileDropTokensPass();
   mlir::triton::registerRewriteAssumeWithCudaTilePass();
   mlir::triton::registerAutoGenMemoryTokenPass();
   registry.insert<mlir::cuda_tile::CudaTileDialect>();

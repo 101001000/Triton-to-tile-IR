@@ -7,6 +7,7 @@ namespace mlir {
 namespace triton {
 
 std::unique_ptr<Pass> createConvertCudaTileToTritonPass();
+std::unique_ptr<Pass> createCudaTileDropTokensPass();
 
 // Generate the pass class declarations (and options structs).
 #define GEN_PASS_DECL
